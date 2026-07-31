@@ -17,7 +17,8 @@ contract ExchangeTest is Test {
     function setUp() public {
         usdc = new MockUSDC();
         ctf = IConditionalTokens(deployCode("ConditionalTokens.sol:ConditionalTokens"));
-        exchange = new Exchange(ctf, IERC20(address(usdc)));
+        // this test contract is the owner + operator; fee starts at 0
+        exchange = new Exchange(ctf, IERC20(address(usdc)), address(this), 0);
         (maker, makerPk) = makeAddrAndKey("maker");
     }
 
@@ -272,6 +273,76 @@ contract ExchangeTest is Test {
         // 100. the remaining 100 backs their unused halves (yseller NO + nseller YES).
         assertEq(usdc.balanceOf(address(ctf)), 100e6, "one set burned; the other still backed");
         assertEq(usdc.balanceOf(address(exchange)), 5e6, "surplus spread retained");
+    }
+
+    function test_non_operator_reverts() public {
+        Exchange.Order memory a = _order();
+        a.signature = _sign(makerPk, a);
+        vm.prank(address(0xBAD));
+        vm.expectRevert("Exchange: not operator");
+        exchange.fillTransfer(a, a, 1);
+    }
+
+    function test_transfer_fee_accrues_and_withdraws() public {
+        exchange.setFeeRateBps(100); // 1%
+
+        address oracle = makeAddr("oracle2");
+        bytes32 questionId = keccak256("fee mkt");
+        ctf.prepareCondition(oracle, questionId, 2);
+        bytes32 conditionId = ctf.getConditionId(oracle, questionId, 2);
+        (uint256 yesId,) = exchange.registerMarket(conditionId);
+
+        (address buyer, uint256 buyerPk) = makeAddrAndKey("feebuyer");
+        (address seller, uint256 sellerPk) = makeAddrAndKey("feeseller");
+
+        usdc.mint(seller, 100e6);
+        uint256[] memory partition = new uint256[](2);
+        partition[0] = 1;
+        partition[1] = 2;
+        vm.startPrank(seller);
+        usdc.approve(address(ctf), 100e6);
+        ctf.splitPosition(address(usdc), bytes32(0), conditionId, partition, 100e6);
+        ctf.setApprovalForAll(address(exchange), true);
+        vm.stopPrank();
+
+        usdc.mint(buyer, 1000e6);
+        vm.prank(buyer);
+        usdc.approve(address(exchange), type(uint256).max);
+
+        Exchange.Order memory buyOrder = Exchange.Order({
+            salt: 1,
+            maker: buyer,
+            tokenId: yesId,
+            makerAmount: 55e6,
+            takerAmount: 100e6,
+            expiration: 0,
+            nonce: 0,
+            side: Exchange.Side.BUY,
+            signature: ""
+        });
+        buyOrder.signature = _sign(buyerPk, buyOrder);
+        Exchange.Order memory sellOrder = Exchange.Order({
+            salt: 2,
+            maker: seller,
+            tokenId: yesId,
+            makerAmount: 100e6,
+            takerAmount: 55e6,
+            expiration: 0,
+            nonce: 0,
+            side: Exchange.Side.SELL,
+            signature: ""
+        });
+        sellOrder.signature = _sign(sellerPk, sellOrder);
+
+        exchange.fillTransfer(buyOrder, sellOrder, 100e6);
+
+        // cost 55, fee 1% = 0.55 -> seller nets 54.45, exchange keeps 0.55
+        assertEq(usdc.balanceOf(seller), 54_450000, "seller net of fee");
+        assertEq(usdc.balanceOf(address(exchange)), 550000, "fee accrued");
+
+        // owner withdraws the accrued fee
+        exchange.withdrawFees(address(0xFEE), 550000);
+        assertEq(usdc.balanceOf(address(0xFEE)), 550000);
     }
 
     function test_register_market() public {

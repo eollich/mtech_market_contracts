@@ -7,11 +7,12 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IConditionalTokens} from "./interfaces/IConditionalTokens.sol";
 
 // the exchange: users sign orders off-chain; the operator matches them and
 // submits fills here. ERC1155Holder so it can custody outcome tokens mid-fill.
-contract Exchange is EIP712, ERC1155Holder {
+contract Exchange is EIP712, ERC1155Holder, Ownable {
     using SafeERC20 for IERC20;
 
     enum Side {
@@ -54,14 +55,45 @@ contract Exchange is EIP712, ERC1155Holder {
     IConditionalTokens public immutable ctf;
     IERC20 public immutable collateral;
 
+    address public operator; // only address allowed to submit fills
+    uint256 public feeRateBps; // fee on fills, in basis points (100 = 1%)
+
+    modifier onlyOperator() {
+        require(msg.sender == operator, "Exchange: not operator");
+        _;
+    }
+
     event OrderCancelled(bytes32 indexed orderHash, address indexed maker);
     event MarketRegistered(bytes32 indexed conditionId, uint256 yesTokenId, uint256 noTokenId);
+    event OperatorSet(address indexed operator);
+    event FeeRateSet(uint256 bps);
 
-    constructor(IConditionalTokens _ctf, IERC20 _collateral) EIP712("mtech_market", "1") {
+    constructor(IConditionalTokens _ctf, IERC20 _collateral, address _operator, uint256 _feeRateBps)
+        EIP712("mtech_market", "1")
+        Ownable(msg.sender)
+    {
         ctf = _ctf;
         collateral = _collateral;
+        operator = _operator;
+        feeRateBps = _feeRateBps;
         // let the CTF pull our collateral when we splitPosition during a mint
         _collateral.approve(address(_ctf), type(uint256).max);
+    }
+
+    function setOperator(address _operator) external onlyOwner {
+        operator = _operator;
+        emit OperatorSet(_operator);
+    }
+
+    function setFeeRateBps(uint256 _bps) external onlyOwner {
+        require(_bps <= 1000, "Exchange: fee too high"); // cap at 10%
+        feeRateBps = _bps;
+        emit FeeRateSet(_bps);
+    }
+
+    // the owner pulls accrued revenue (transfer fees + mint/merge spread) in USDC
+    function withdrawFees(address to, uint256 amount) external onlyOwner {
+        collateral.safeTransfer(to, amount);
     }
 
     // derive and store the YES/NO outcome-token ids for a prepared condition.
@@ -144,6 +176,7 @@ contract Exchange is EIP712, ERC1155Holder {
     // asset swap. executed at the seller's (resting) price. operator-submitted.
     function fillTransfer(Order calldata buyOrder, Order calldata sellOrder, uint256 tokenAmount)
         external
+        onlyOperator
     {
         require(buyOrder.side == Side.BUY && sellOrder.side == Side.SELL, "Exchange: sides");
         require(buyOrder.tokenId == sellOrder.tokenId, "Exchange: token mismatch");
@@ -168,8 +201,12 @@ contract Exchange is EIP712, ERC1155Holder {
         filled[buyHash] += cost;
         filled[sellHash] += tokenAmount;
 
-        // both parties approved the exchange: buyer -> seller USDC, seller -> buyer tokens
-        collateral.safeTransferFrom(buyOrder.maker, sellOrder.maker, cost);
+        // buyer pays `cost`: the seller receives cost - fee, the exchange keeps the fee
+        uint256 fee = cost * feeRateBps / 10000;
+        collateral.safeTransferFrom(buyOrder.maker, sellOrder.maker, cost - fee);
+        if (fee > 0) {
+            collateral.safeTransferFrom(buyOrder.maker, address(this), fee);
+        }
         IERC1155(address(ctf)).safeTransferFrom(
             sellOrder.maker, buyOrder.maker, buyOrder.tokenId, tokenAmount, ""
         );
@@ -183,7 +220,10 @@ contract Exchange is EIP712, ERC1155Holder {
     // tokens -- the exchange collects USDC from both, splits a complete set via
     // the CTF, and hands each their side. if their prices sum to > 1 the surplus
     // stays in the exchange as spread.
-    function fillMint(Order calldata yesBuy, Order calldata noBuy, uint256 setAmount) external {
+    function fillMint(Order calldata yesBuy, Order calldata noBuy, uint256 setAmount)
+        external
+        onlyOperator
+    {
         require(yesBuy.side == Side.BUY && noBuy.side == Side.BUY, "Exchange: sides");
         TokenInfo memory yInfo = tokens[yesBuy.tokenId];
         require(yInfo.registered && yInfo.complement == noBuy.tokenId, "Exchange: not complements");
@@ -231,7 +271,10 @@ contract Exchange is EIP712, ERC1155Holder {
     // MERGE match: SELL YES x SELL NO on complementary tokens. both sellers
     // deliver their tokens; the exchange burns the set via the CTF back into
     // USDC and pays each seller their price. surplus (if prices sum < 1) stays.
-    function fillMerge(Order calldata yesSell, Order calldata noSell, uint256 setAmount) external {
+    function fillMerge(Order calldata yesSell, Order calldata noSell, uint256 setAmount)
+        external
+        onlyOperator
+    {
         require(yesSell.side == Side.SELL && noSell.side == Side.SELL, "Exchange: sides");
         TokenInfo memory yInfo = tokens[yesSell.tokenId];
         require(yInfo.registered && yInfo.complement == noSell.tokenId, "Exchange: not complements");
