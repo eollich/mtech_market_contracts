@@ -98,15 +98,10 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
 
     // derive and store the YES/NO outcome-token ids for a prepared condition.
     // idempotent + deterministic -- just computes ids from the CTF.
-    function registerMarket(bytes32 conditionId)
-        external
-        returns (uint256 yesTokenId, uint256 noTokenId)
-    {
+    function registerMarket(bytes32 conditionId) external returns (uint256 yesTokenId, uint256 noTokenId) {
         // index set 0b01 = YES (slot 0), 0b10 = NO (slot 1)
-        uint256 yesId =
-            ctf.getPositionId(address(collateral), ctf.getCollectionId(bytes32(0), conditionId, 1));
-        uint256 noId =
-            ctf.getPositionId(address(collateral), ctf.getCollectionId(bytes32(0), conditionId, 2));
+        uint256 yesId = ctf.getPositionId(address(collateral), ctf.getCollectionId(bytes32(0), conditionId, 1));
+        uint256 noId = ctf.getPositionId(address(collateral), ctf.getCollectionId(bytes32(0), conditionId, 2));
 
         tokens[yesId] = TokenInfo(true, noId, conditionId);
         tokens[noId] = TokenInfo(true, yesId, conditionId);
@@ -120,15 +115,7 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
     function hashOrder(Order calldata o) public view returns (bytes32) {
         bytes32 structHash = keccak256(
             abi.encode(
-                ORDER_TYPEHASH,
-                o.salt,
-                o.maker,
-                o.tokenId,
-                o.makerAmount,
-                o.takerAmount,
-                o.expiration,
-                o.nonce,
-                o.side
+                ORDER_TYPEHASH, o.salt, o.maker, o.tokenId, o.makerAmount, o.takerAmount, o.expiration, o.nonce, o.side
             )
         );
         return _hashTypedDataV4(structHash);
@@ -142,11 +129,7 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
 
     // full check before a fill: valid signature, not expired, still fillable.
     // returns the order hash and how much of makerAmount remains.
-    function validateOrder(Order calldata o)
-        public
-        view
-        returns (bytes32 orderHash, uint256 remaining)
-    {
+    function validateOrder(Order calldata o) public view returns (bytes32 orderHash, uint256 remaining) {
         orderHash = hashOrder(o);
         require(ECDSA.recover(orderHash, o.signature) == o.maker, "Exchange: bad signature");
         require(o.expiration == 0 || block.timestamp <= o.expiration, "Exchange: expired");
@@ -163,13 +146,7 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
         emit OrderCancelled(orderHash, o.maker);
     }
 
-    event Fill(
-        bytes32 indexed buyHash,
-        bytes32 indexed sellHash,
-        uint256 tokenId,
-        uint256 tokenAmount,
-        uint256 cost
-    );
+    event Fill(bytes32 indexed buyHash, bytes32 indexed sellHash, uint256 tokenId, uint256 tokenAmount, uint256 cost);
 
     // TRANSFER match: a BUY and a SELL of the SAME outcome token. the buyer
     // pays the seller, the seller's tokens move to the buyer. no CTF -- a pure
@@ -188,8 +165,7 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
         // prices cross: buyer's limit >= seller's limit (cross-multiplied, no division).
         // buy price = makerAmount(USDC)/takerAmount(tok); sell price = takerAmount/makerAmount
         require(
-            buyOrder.makerAmount * sellOrder.makerAmount
-                >= sellOrder.takerAmount * buyOrder.takerAmount,
+            buyOrder.makerAmount * sellOrder.makerAmount >= sellOrder.takerAmount * buyOrder.takerAmount,
             "Exchange: no cross"
         );
 
@@ -207,9 +183,7 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
         if (fee > 0) {
             collateral.safeTransferFrom(buyOrder.maker, address(this), fee);
         }
-        IERC1155(address(ctf)).safeTransferFrom(
-            sellOrder.maker, buyOrder.maker, buyOrder.tokenId, tokenAmount, ""
-        );
+        IERC1155(address(ctf)).safeTransferFrom(sellOrder.maker, buyOrder.maker, buyOrder.tokenId, tokenAmount, "");
 
         emit Fill(buyHash, sellHash, buyOrder.tokenId, tokenAmount, cost);
     }
@@ -220,10 +194,7 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
     // tokens -- the exchange collects USDC from both, splits a complete set via
     // the CTF, and hands each their side. if their prices sum to > 1 the surplus
     // stays in the exchange as spread.
-    function fillMint(Order calldata yesBuy, Order calldata noBuy, uint256 setAmount)
-        external
-        onlyOperator
-    {
+    function fillMint(Order calldata yesBuy, Order calldata noBuy, uint256 setAmount) external onlyOperator {
         require(yesBuy.side == Side.BUY && noBuy.side == Side.BUY, "Exchange: sides");
         TokenInfo memory yInfo = tokens[yesBuy.tokenId];
         require(yInfo.registered && yInfo.complement == noBuy.tokenId, "Exchange: not complements");
@@ -256,12 +227,8 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
         ctf.splitPosition(address(collateral), bytes32(0), yInfo.conditionId, partition, setAmount);
 
         // hand each buyer their side
-        IERC1155(address(ctf)).safeTransferFrom(
-            address(this), yesBuy.maker, yesBuy.tokenId, setAmount, ""
-        );
-        IERC1155(address(ctf)).safeTransferFrom(
-            address(this), noBuy.maker, noBuy.tokenId, setAmount, ""
-        );
+        IERC1155(address(ctf)).safeTransferFrom(address(this), yesBuy.maker, yesBuy.tokenId, setAmount, "");
+        IERC1155(address(ctf)).safeTransferFrom(address(this), noBuy.maker, noBuy.tokenId, setAmount, "");
 
         emit Mint(yesHash, noHash, setAmount);
     }
@@ -271,10 +238,7 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
     // MERGE match: SELL YES x SELL NO on complementary tokens. both sellers
     // deliver their tokens; the exchange burns the set via the CTF back into
     // USDC and pays each seller their price. surplus (if prices sum < 1) stays.
-    function fillMerge(Order calldata yesSell, Order calldata noSell, uint256 setAmount)
-        external
-        onlyOperator
-    {
+    function fillMerge(Order calldata yesSell, Order calldata noSell, uint256 setAmount) external onlyOperator {
         require(yesSell.side == Side.SELL && noSell.side == Side.SELL, "Exchange: sides");
         TokenInfo memory yInfo = tokens[yesSell.tokenId];
         require(yInfo.registered && yInfo.complement == noSell.tokenId, "Exchange: not complements");
@@ -294,12 +258,8 @@ contract Exchange is EIP712, ERC1155Holder, Ownable {
         filled[noHash] += setAmount;
 
         // pull both tokens into the exchange
-        IERC1155(address(ctf)).safeTransferFrom(
-            yesSell.maker, address(this), yesSell.tokenId, setAmount, ""
-        );
-        IERC1155(address(ctf)).safeTransferFrom(
-            noSell.maker, address(this), noSell.tokenId, setAmount, ""
-        );
+        IERC1155(address(ctf)).safeTransferFrom(yesSell.maker, address(this), yesSell.tokenId, setAmount, "");
+        IERC1155(address(ctf)).safeTransferFrom(noSell.maker, address(this), noSell.tokenId, setAmount, "");
 
         // burn the set -> setAmount USDC back to the exchange
         uint256[] memory partition = new uint256[](2);

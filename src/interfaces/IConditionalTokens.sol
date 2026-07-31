@@ -5,8 +5,7 @@ pragma solidity ^0.8.20;
 // takes IERC20 for collateral, but at the abi level that's just an address, so
 // we use address here and stay abi-compatible. deployed via vm.deployCode.
 interface IConditionalTokens {
-    function prepareCondition(address oracle, bytes32 questionId, uint256 outcomeSlotCount)
-        external;
+    function prepareCondition(address oracle, bytes32 questionId, uint256 outcomeSlotCount) external;
 
     function reportPayouts(bytes32 questionId, uint256[] calldata payouts) external;
 
@@ -46,10 +45,7 @@ interface IConditionalTokens {
         view
         returns (bytes32);
 
-    function getPositionId(address collateralToken, bytes32 collectionId)
-        external
-        pure
-        returns (uint256);
+    function getPositionId(address collateralToken, bytes32 collectionId) external pure returns (uint256);
 
     function getOutcomeSlotCount(bytes32 conditionId) external view returns (uint256);
 
