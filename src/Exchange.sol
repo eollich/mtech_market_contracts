@@ -176,4 +176,100 @@ contract Exchange is EIP712, ERC1155Holder {
 
         emit Fill(buyHash, sellHash, buyOrder.tokenId, tokenAmount, cost);
     }
+
+    event Mint(bytes32 indexed yesHash, bytes32 indexed noHash, uint256 setAmount);
+
+    // MINT match: BUY YES x BUY NO on complementary tokens. neither buyer owns
+    // tokens -- the exchange collects USDC from both, splits a complete set via
+    // the CTF, and hands each their side. if their prices sum to > 1 the surplus
+    // stays in the exchange as spread.
+    function fillMint(Order calldata yesBuy, Order calldata noBuy, uint256 setAmount) external {
+        require(yesBuy.side == Side.BUY && noBuy.side == Side.BUY, "Exchange: sides");
+        TokenInfo memory yInfo = tokens[yesBuy.tokenId];
+        require(yInfo.registered && yInfo.complement == noBuy.tokenId, "Exchange: not complements");
+
+        (bytes32 yesHash, uint256 yesRemaining) = validateOrder(yesBuy);
+        (bytes32 noHash, uint256 noRemaining) = validateOrder(noBuy);
+
+        // the two buyers together must cover a $1 set: priceYes + priceNo >= 1
+        require(
+            yesBuy.makerAmount * noBuy.takerAmount + noBuy.makerAmount * yesBuy.takerAmount
+                >= yesBuy.takerAmount * noBuy.takerAmount,
+            "Exchange: no cross"
+        );
+
+        uint256 costYes = setAmount * yesBuy.makerAmount / yesBuy.takerAmount;
+        uint256 costNo = setAmount * noBuy.makerAmount / noBuy.takerAmount;
+        require(costYes <= yesRemaining && costNo <= noRemaining, "Exchange: exceeded");
+
+        filled[yesHash] += costYes;
+        filled[noHash] += costNo;
+
+        // collect USDC from both buyers into the exchange
+        collateral.safeTransferFrom(yesBuy.maker, address(this), costYes);
+        collateral.safeTransferFrom(noBuy.maker, address(this), costNo);
+
+        // mint a complete set: setAmount USDC (pulled from us) -> setAmount YES + NO to us
+        uint256[] memory partition = new uint256[](2);
+        partition[0] = 1;
+        partition[1] = 2;
+        ctf.splitPosition(address(collateral), bytes32(0), yInfo.conditionId, partition, setAmount);
+
+        // hand each buyer their side
+        IERC1155(address(ctf)).safeTransferFrom(
+            address(this), yesBuy.maker, yesBuy.tokenId, setAmount, ""
+        );
+        IERC1155(address(ctf)).safeTransferFrom(
+            address(this), noBuy.maker, noBuy.tokenId, setAmount, ""
+        );
+
+        emit Mint(yesHash, noHash, setAmount);
+    }
+
+    event Merge(bytes32 indexed yesHash, bytes32 indexed noHash, uint256 setAmount);
+
+    // MERGE match: SELL YES x SELL NO on complementary tokens. both sellers
+    // deliver their tokens; the exchange burns the set via the CTF back into
+    // USDC and pays each seller their price. surplus (if prices sum < 1) stays.
+    function fillMerge(Order calldata yesSell, Order calldata noSell, uint256 setAmount) external {
+        require(yesSell.side == Side.SELL && noSell.side == Side.SELL, "Exchange: sides");
+        TokenInfo memory yInfo = tokens[yesSell.tokenId];
+        require(yInfo.registered && yInfo.complement == noSell.tokenId, "Exchange: not complements");
+
+        (bytes32 yesHash, uint256 yesRemaining) = validateOrder(yesSell);
+        (bytes32 noHash, uint256 noRemaining) = validateOrder(noSell);
+
+        // sellers together accept <= $1 for the set they destroy: priceYes + priceNo <= 1
+        require(
+            yesSell.takerAmount * noSell.makerAmount + noSell.takerAmount * yesSell.makerAmount
+                <= yesSell.makerAmount * noSell.makerAmount,
+            "Exchange: no cross"
+        );
+
+        require(setAmount <= yesRemaining && setAmount <= noRemaining, "Exchange: exceeded");
+        filled[yesHash] += setAmount;
+        filled[noHash] += setAmount;
+
+        // pull both tokens into the exchange
+        IERC1155(address(ctf)).safeTransferFrom(
+            yesSell.maker, address(this), yesSell.tokenId, setAmount, ""
+        );
+        IERC1155(address(ctf)).safeTransferFrom(
+            noSell.maker, address(this), noSell.tokenId, setAmount, ""
+        );
+
+        // burn the set -> setAmount USDC back to the exchange
+        uint256[] memory partition = new uint256[](2);
+        partition[0] = 1;
+        partition[1] = 2;
+        ctf.mergePositions(address(collateral), bytes32(0), yInfo.conditionId, partition, setAmount);
+
+        // pay each seller their price
+        uint256 payYes = setAmount * yesSell.takerAmount / yesSell.makerAmount;
+        uint256 payNo = setAmount * noSell.takerAmount / noSell.makerAmount;
+        collateral.safeTransfer(yesSell.maker, payYes);
+        collateral.safeTransfer(noSell.maker, payNo);
+
+        emit Merge(yesHash, noHash, setAmount);
+    }
 }
