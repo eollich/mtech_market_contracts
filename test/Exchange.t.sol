@@ -2,15 +2,22 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Exchange} from "../src/Exchange.sol";
+import {MockUSDC} from "../src/MockUSDC.sol";
+import {IConditionalTokens} from "../src/interfaces/IConditionalTokens.sol";
 
 contract ExchangeTest is Test {
     Exchange exchange;
+    MockUSDC usdc;
+    IConditionalTokens ctf;
     address maker;
     uint256 makerPk;
 
     function setUp() public {
-        exchange = new Exchange();
+        usdc = new MockUSDC();
+        ctf = IConditionalTokens(deployCode("ConditionalTokens.sol:ConditionalTokens"));
+        exchange = new Exchange(ctf, IERC20(address(usdc)));
         (maker, makerPk) = makeAddrAndKey("maker");
     }
 
@@ -85,5 +92,85 @@ contract ExchangeTest is Test {
         vm.prank(address(0xBAD));
         vm.expectRevert("Exchange: not maker");
         exchange.cancelOrder(o);
+    }
+
+    function test_fill_transfer() public {
+        // a market with a registered YES token
+        address oracle = makeAddr("oracle");
+        bytes32 questionId = keccak256("rain?");
+        ctf.prepareCondition(oracle, questionId, 2);
+        bytes32 conditionId = ctf.getConditionId(oracle, questionId, 2);
+        (uint256 yesId,) = exchange.registerMarket(conditionId);
+
+        (address buyer, uint256 buyerPk) = makeAddrAndKey("buyer");
+        (address seller, uint256 sellerPk) = makeAddrAndKey("seller");
+
+        // seller mints a complete set (100 USDC -> 100 YES + 100 NO), keeps YES
+        usdc.mint(seller, 100e6);
+        uint256[] memory partition = new uint256[](2);
+        partition[0] = 1;
+        partition[1] = 2;
+        vm.startPrank(seller);
+        usdc.approve(address(ctf), 100e6);
+        ctf.splitPosition(address(usdc), bytes32(0), conditionId, partition, 100e6);
+        ctf.setApprovalForAll(address(exchange), true); // exchange may move seller's YES
+        vm.stopPrank();
+
+        // buyer funds + approves the exchange for USDC
+        usdc.mint(buyer, 1000e6);
+        vm.prank(buyer);
+        usdc.approve(address(exchange), type(uint256).max);
+
+        // BUY 100 YES @0.55 and SELL 100 YES @0.55 (they cross)
+        Exchange.Order memory buyOrder = Exchange.Order({
+            salt: 1,
+            maker: buyer,
+            tokenId: yesId,
+            makerAmount: 55e6, // pays 55 USDC
+            takerAmount: 100e6, // for 100 YES
+            expiration: 0,
+            nonce: 0,
+            side: Exchange.Side.BUY,
+            signature: ""
+        });
+        buyOrder.signature = _sign(buyerPk, buyOrder);
+
+        Exchange.Order memory sellOrder = Exchange.Order({
+            salt: 2,
+            maker: seller,
+            tokenId: yesId,
+            makerAmount: 100e6, // gives 100 YES
+            takerAmount: 55e6, // for 55 USDC
+            expiration: 0,
+            nonce: 0,
+            side: Exchange.Side.SELL,
+            signature: ""
+        });
+        sellOrder.signature = _sign(sellerPk, sellOrder);
+
+        // operator submits the matched pair
+        exchange.fillTransfer(buyOrder, sellOrder, 100e6);
+
+        assertEq(ctf.balanceOf(buyer, yesId), 100e6, "buyer got 100 YES");
+        assertEq(ctf.balanceOf(seller, yesId), 0, "seller's YES moved out");
+        assertEq(usdc.balanceOf(buyer), 1000e6 - 55e6, "buyer paid 55");
+        assertEq(usdc.balanceOf(seller), 55e6, "seller received 55");
+    }
+
+    function test_register_market() public {
+        address oracle = makeAddr("oracle");
+        bytes32 questionId = keccak256("will it rain?");
+        ctf.prepareCondition(oracle, questionId, 2);
+        bytes32 conditionId = ctf.getConditionId(oracle, questionId, 2);
+
+        (uint256 yesId, uint256 noId) = exchange.registerMarket(conditionId);
+        assertTrue(yesId != noId);
+
+        (bool rY, uint256 compY, bytes32 condY) = exchange.tokens(yesId);
+        (bool rN, uint256 compN,) = exchange.tokens(noId);
+        assertTrue(rY && rN, "both registered");
+        assertEq(compY, noId, "YES complement is NO");
+        assertEq(compN, yesId, "NO complement is YES");
+        assertEq(condY, conditionId);
     }
 }

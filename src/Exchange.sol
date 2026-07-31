@@ -3,11 +3,17 @@ pragma solidity ^0.8.20;
 
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import {IConditionalTokens} from "./interfaces/IConditionalTokens.sol";
 
 // the exchange: users sign orders off-chain; the operator matches them and
-// submits fills here. this first slice is just the signed-order primitive --
-// the Order struct, its EIP-712 hash, and signature verification.
-contract Exchange is EIP712 {
+// submits fills here. ERC1155Holder so it can custody outcome tokens mid-fill.
+contract Exchange is EIP712, ERC1155Holder {
+    using SafeERC20 for IERC20;
+
     enum Side {
         BUY, // maker pays collateral to receive outcome tokens
         SELL // maker gives outcome tokens to receive collateral
@@ -35,9 +41,46 @@ contract Exchange is EIP712 {
     // to makerAmount (fully consumed), which also blocks any future fill.
     mapping(bytes32 => uint256) public filled;
 
-    event OrderCancelled(bytes32 indexed orderHash, address indexed maker);
+    // a registered outcome token: its complement (YES<->NO) and its condition.
+    // registering a market lets a fill tell mint/merge/transfer apart.
+    struct TokenInfo {
+        bool registered;
+        uint256 complement;
+        bytes32 conditionId;
+    }
 
-    constructor() EIP712("mtech_market", "1") {}
+    mapping(uint256 => TokenInfo) public tokens; // tokenId => info
+
+    IConditionalTokens public immutable ctf;
+    IERC20 public immutable collateral;
+
+    event OrderCancelled(bytes32 indexed orderHash, address indexed maker);
+    event MarketRegistered(bytes32 indexed conditionId, uint256 yesTokenId, uint256 noTokenId);
+
+    constructor(IConditionalTokens _ctf, IERC20 _collateral) EIP712("mtech_market", "1") {
+        ctf = _ctf;
+        collateral = _collateral;
+        // let the CTF pull our collateral when we splitPosition during a mint
+        _collateral.approve(address(_ctf), type(uint256).max);
+    }
+
+    // derive and store the YES/NO outcome-token ids for a prepared condition.
+    // idempotent + deterministic -- just computes ids from the CTF.
+    function registerMarket(bytes32 conditionId)
+        external
+        returns (uint256 yesTokenId, uint256 noTokenId)
+    {
+        // index set 0b01 = YES (slot 0), 0b10 = NO (slot 1)
+        uint256 yesId =
+            ctf.getPositionId(address(collateral), ctf.getCollectionId(bytes32(0), conditionId, 1));
+        uint256 noId =
+            ctf.getPositionId(address(collateral), ctf.getCollectionId(bytes32(0), conditionId, 2));
+
+        tokens[yesId] = TokenInfo(true, noId, conditionId);
+        tokens[noId] = TokenInfo(true, yesId, conditionId);
+        emit MarketRegistered(conditionId, yesId, noId);
+        return (yesId, noId);
+    }
 
     // the digest a wallet actually signs: domain-separated hash of the order.
     // _hashTypedDataV4 prepends "\x19\x01" + the domain separator, so a
@@ -86,5 +129,51 @@ contract Exchange is EIP712 {
         bytes32 orderHash = hashOrder(o);
         filled[orderHash] = o.makerAmount;
         emit OrderCancelled(orderHash, o.maker);
+    }
+
+    event Fill(
+        bytes32 indexed buyHash,
+        bytes32 indexed sellHash,
+        uint256 tokenId,
+        uint256 tokenAmount,
+        uint256 cost
+    );
+
+    // TRANSFER match: a BUY and a SELL of the SAME outcome token. the buyer
+    // pays the seller, the seller's tokens move to the buyer. no CTF -- a pure
+    // asset swap. executed at the seller's (resting) price. operator-submitted.
+    function fillTransfer(Order calldata buyOrder, Order calldata sellOrder, uint256 tokenAmount)
+        external
+    {
+        require(buyOrder.side == Side.BUY && sellOrder.side == Side.SELL, "Exchange: sides");
+        require(buyOrder.tokenId == sellOrder.tokenId, "Exchange: token mismatch");
+        require(tokens[buyOrder.tokenId].registered, "Exchange: unregistered token");
+
+        (bytes32 buyHash, uint256 buyRemainingUsdc) = validateOrder(buyOrder);
+        (bytes32 sellHash, uint256 sellRemainingTokens) = validateOrder(sellOrder);
+
+        // prices cross: buyer's limit >= seller's limit (cross-multiplied, no division).
+        // buy price = makerAmount(USDC)/takerAmount(tok); sell price = takerAmount/makerAmount
+        require(
+            buyOrder.makerAmount * sellOrder.makerAmount
+                >= sellOrder.takerAmount * buyOrder.takerAmount,
+            "Exchange: no cross"
+        );
+
+        // execute at the seller's price
+        uint256 cost = tokenAmount * sellOrder.takerAmount / sellOrder.makerAmount;
+        require(tokenAmount <= sellRemainingTokens, "Exchange: sell exceeded");
+        require(cost <= buyRemainingUsdc, "Exchange: buy exceeded");
+
+        filled[buyHash] += cost;
+        filled[sellHash] += tokenAmount;
+
+        // both parties approved the exchange: buyer -> seller USDC, seller -> buyer tokens
+        collateral.safeTransferFrom(buyOrder.maker, sellOrder.maker, cost);
+        IERC1155(address(ctf)).safeTransferFrom(
+            sellOrder.maker, buyOrder.maker, buyOrder.tokenId, tokenAmount, ""
+        );
+
+        emit Fill(buyHash, sellHash, buyOrder.tokenId, tokenAmount, cost);
     }
 }

@@ -55,4 +55,7 @@ interface IConditionalTokens {
 
     // ERC-1155 balance of an outcome-token position
     function balanceOf(address account, uint256 id) external view returns (uint256);
+
+    // ERC-1155 operator approval (let the exchange move your outcome tokens)
+    function setApprovalForAll(address operator, bool approved) external;
 }
